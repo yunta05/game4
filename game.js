@@ -1,6 +1,8 @@
 (() => {
   const SIZE = 5;
   const STORAGE_KEY = 'line-fixed-puzzle-v1';
+  const SHIFT_MS = 140;
+  const POP_MS = 180;
 
   const els = {
     board: document.getElementById('board'),
@@ -27,11 +29,11 @@
     bestScore: 0,
     maxTile: 0,
     bestTile: 0,
-    turn: 0,
     selectedLine: { type: 'row', index: 2 },
     gameOver: false,
+    runningAnimation: false,
+    pendingLineType: 'row',
     mergeMultiplierLabel: 'k回目の合成: 生成値 × (k+1)',
-    shiftedCells: new Set(),
     mergedCells: new Set(),
   };
 
@@ -93,24 +95,25 @@
     const [r, c] = empties[Math.floor(random() * empties.length)];
     state.board[r][c] = pickSpawnValue(empties.length);
     state.maxTile = Math.max(state.maxTile, state.board[r][c]);
-    return true;
+    return { r, c, value: state.board[r][c] };
   }
 
-  function shiftLine(type, index, dir) {
-    const next = cloneBoard(state.board);
-    const shifted = new Set();
+  function shiftLine(board, type, index, dir) {
+    const next = cloneBoard(board);
+    const moved = [];
+
     if (type === 'row') {
-      const row = state.board[index];
+      const row = board[index];
       if (dir === 'left') {
         for (let c = 0; c < SIZE - 1; c += 1) {
           next[index][c] = row[c + 1];
-          shifted.add(`${index},${c}`);
+          if (row[c + 1] !== 0) moved.push({ from: [index, c + 1], to: [index, c], value: row[c + 1] });
         }
         next[index][SIZE - 1] = 0;
       } else if (dir === 'right') {
         for (let c = SIZE - 1; c > 0; c -= 1) {
           next[index][c] = row[c - 1];
-          shifted.add(`${index},${c}`);
+          if (row[c - 1] !== 0) moved.push({ from: [index, c - 1], to: [index, c], value: row[c - 1] });
         }
         next[index][0] = 0;
       } else {
@@ -119,27 +122,29 @@
     } else {
       if (dir === 'up') {
         for (let r = 0; r < SIZE - 1; r += 1) {
-          next[r][index] = state.board[r + 1][index];
-          shifted.add(`${r},${index}`);
+          next[r][index] = board[r + 1][index];
+          if (board[r + 1][index] !== 0) moved.push({ from: [r + 1, index], to: [r, index], value: board[r + 1][index] });
         }
         next[SIZE - 1][index] = 0;
       } else if (dir === 'down') {
         for (let r = SIZE - 1; r > 0; r -= 1) {
-          next[r][index] = state.board[r - 1][index];
-          shifted.add(`${r},${index}`);
+          next[r][index] = board[r - 1][index];
+          if (board[r - 1][index] !== 0) moved.push({ from: [r - 1, index], to: [r, index], value: board[r - 1][index] });
         }
         next[0][index] = 0;
       } else {
         return null;
       }
     }
-    return { board: next, shifted };
+
+    return { board: next, moved };
   }
 
   function mergePhase(board) {
     let chain = 0;
     let totalGain = 0;
     const mergedCells = new Set();
+    const mergeEvents = [];
 
     while (true) {
       const mergedThisRound = Array.from({ length: SIZE }, () => Array(SIZE).fill(false));
@@ -171,22 +176,21 @@
       if (ops.length === 0) break;
       chain += 1;
       const multiplier = chain + 1;
+
       for (const op of ops) {
         const [fromR, fromC] = op.from;
         const [toR, toC] = op.to;
         board[fromR][fromC] = 0;
         board[toR][toC] = op.value;
-        totalGain += op.value * multiplier;
+        const gain = op.value * multiplier;
+        totalGain += gain;
         mergedCells.add(`${toR},${toC}`);
+        mergeEvents.push({ ...op, chain, gain });
         state.maxTile = Math.max(state.maxTile, op.value);
       }
     }
 
-    return { board, chainCount: chain, gain: totalGain, mergedCells };
-  }
-
-  function canMove() {
-    return listEmpties().length > 0;
+    return { board, chainCount: chain, gain: totalGain, mergedCells, mergeEvents };
   }
 
   function updateStorage() {
@@ -211,47 +215,23 @@
     }
   }
 
-  function executeTurn(dir) {
-    if (state.gameOver) return;
-    const { type, index } = state.selectedLine;
-    const shiftResult = shiftLine(type, index, dir);
-    if (!shiftResult) return;
-
-    state.board = shiftResult.board;
-    state.shiftedCells = shiftResult.shifted;
-
-    const merged = mergePhase(state.board);
-    state.mergedCells = merged.mergedCells;
-    state.score += merged.gain;
-
-    const spawned = spawnOne();
-    state.turn += 1;
-
-    if (!spawned && !canMove()) {
-      state.gameOver = true;
-      els.status.textContent = 'Game Over: 空セルがありません';
-      els.status.classList.add('over');
-    } else {
-      els.status.classList.remove('over');
-      els.status.textContent = merged.chainCount > 1
-        ? `連鎖 ${merged.chainCount} / 倍率ルール: ${state.mergeMultiplierLabel}`
-        : ' '; 
-    }
-
-    updateStorage();
-    render();
-  }
-
-  function setSelectedLine(type, index) {
-    state.selectedLine = { type, index };
-    renderSelection();
-  }
-
-  function renderSelection() {
-    document.querySelectorAll('[data-line]').forEach((btn) => btn.classList.remove('active'));
-    const key = `${state.selectedLine.type}:${state.selectedLine.index}`;
-    const target = document.querySelector(`[data-line='${key}']`);
-    if (target) target.classList.add('active');
+  function cellMetrics() {
+    const cell = els.board.firstElementChild;
+    if (!cell) return { stepX: 0, stepY: 0, baseLeft: 0, baseTop: 0 };
+    const boardRect = els.board.getBoundingClientRect();
+    const firstRect = cell.getBoundingClientRect();
+    let secondRect = null;
+    if (els.board.children.length > 1) secondRect = els.board.children[1].getBoundingClientRect();
+    const stepX = secondRect ? secondRect.left - firstRect.left : firstRect.width + 6;
+    const stepY = stepX;
+    return {
+      stepX,
+      stepY,
+      baseLeft: firstRect.left - boardRect.left,
+      baseTop: firstRect.top - boardRect.top,
+      cellW: firstRect.width,
+      cellH: firstRect.height,
+    };
   }
 
   function tileColor(value) {
@@ -271,12 +251,7 @@
           cell.classList.add('filled');
           cell.textContent = String(value);
           cell.style.backgroundColor = tileColor(value);
-        }
-        const key = `${r},${c}`;
-        if (state.shiftedCells.has(key)) cell.classList.add('shifted');
-        if (state.mergedCells.has(key)) {
-          cell.classList.add('merged');
-          spawnFloatingScore(r, c, value);
+          if (state.mergedCells.has(`${r},${c}`)) cell.classList.add('merged-pop');
         }
         els.board.appendChild(cell);
       }
@@ -288,15 +263,122 @@
     els.bestTile.textContent = String(state.bestTile);
   }
 
-  function spawnFloatingScore(r, c, value) {
+  function renderSelection() {
+    document.querySelectorAll('[data-line]').forEach((btn) => btn.classList.remove('active'));
+    const key = `${state.selectedLine.type}:${state.selectedLine.index}`;
+    const target = document.querySelector(`[data-line='${key}']`);
+    if (target) target.classList.add('active');
+  }
+
+  function setSelectedLine(type, index) {
+    state.selectedLine = { type, index };
+    state.pendingLineType = type;
+    renderSelection();
+  }
+
+  function spawnFloatingScore(r, c, text) {
     const marker = document.createElement('span');
     marker.className = 'float-score';
-    marker.textContent = `+${value}`;
+    marker.textContent = text;
     const cellW = els.board.clientWidth / SIZE;
-    marker.style.left = `${c * cellW + cellW * 0.36}px`;
-    marker.style.top = `${r * cellW + cellW * 0.24}px`;
+    marker.style.left = `${c * cellW + cellW * 0.3}px`;
+    marker.style.top = `${r * cellW + cellW * 0.18}px`;
     els.floating.appendChild(marker);
     marker.addEventListener('animationend', () => marker.remove());
+  }
+
+  function animateTurn(shiftMoved, mergeEvents) {
+    return new Promise((resolve) => {
+      const metrics = cellMetrics();
+      const ghosts = [];
+
+      for (const move of shiftMoved) {
+        const ghost = document.createElement('div');
+        ghost.className = 'tile-ghost';
+        ghost.textContent = String(move.value);
+        ghost.style.backgroundColor = tileColor(move.value);
+        ghost.style.width = `${metrics.cellW}px`;
+        ghost.style.height = `${metrics.cellH}px`;
+        const startX = metrics.baseLeft + move.from[1] * metrics.stepX;
+        const startY = metrics.baseTop + move.from[0] * metrics.stepY;
+        const dx = (move.to[1] - move.from[1]) * metrics.stepX;
+        const dy = (move.to[0] - move.from[0]) * metrics.stepY;
+        ghost.style.transform = `translate(${startX}px, ${startY}px)`;
+        els.floating.appendChild(ghost);
+        ghosts.push({ ghost, startX, startY, dx, dy });
+      }
+
+      const begin = performance.now();
+      function frame(now) {
+        const t = Math.min(1, (now - begin) / SHIFT_MS);
+        const ease = 1 - Math.pow(1 - t, 3);
+        for (const g of ghosts) {
+          const x = g.startX + g.dx * ease;
+          const y = g.startY + g.dy * ease;
+          g.ghost.style.transform = `translate(${x}px, ${y}px)`;
+        }
+
+        if (t < 1) {
+          requestAnimationFrame(frame);
+          return;
+        }
+
+        ghosts.forEach((g) => g.ghost.remove());
+
+        mergeEvents.forEach((m, idx) => {
+          const key = `${m.to[0]},${m.to[1]}`;
+          state.mergedCells.add(key);
+          spawnFloatingScore(m.to[0], m.to[1], `+${m.gain}`);
+          const delay = Math.min(160, idx * 22 + (m.chain - 1) * 45);
+          setTimeout(() => {
+            const cellIndex = m.to[0] * SIZE + m.to[1];
+            const cell = els.board.children[cellIndex];
+            if (!cell) return;
+            cell.classList.remove('merged-pop');
+            void cell.offsetWidth;
+            cell.classList.add('merged-pop');
+          }, delay);
+        });
+
+        setTimeout(resolve, POP_MS);
+      }
+
+      requestAnimationFrame(frame);
+    });
+  }
+
+  async function executeTurn(dir) {
+    if (state.gameOver || state.runningAnimation) return;
+    const { type, index } = state.selectedLine;
+
+    const shiftResult = shiftLine(state.board, type, index, dir);
+    if (!shiftResult) return;
+
+    state.runningAnimation = true;
+    const shiftedBoard = shiftResult.board;
+    const merged = mergePhase(cloneBoard(shiftedBoard));
+
+    state.board = merged.board;
+    state.mergedCells = new Set();
+    state.score += merged.gain;
+
+    const spawned = spawnOne();
+
+    if (!spawned) {
+      state.gameOver = true;
+      els.status.textContent = 'Game Over: 空セルがありません';
+      els.status.classList.add('over');
+    } else {
+      els.status.classList.remove('over');
+      els.status.textContent = merged.chainCount > 1
+        ? `連鎖 ${merged.chainCount} / 倍率ルール: ${state.mergeMultiplierLabel}`
+        : ' '; 
+    }
+
+    updateStorage();
+    render();
+    await animateTurn(shiftResult.moved, merged.mergeEvents);
+    state.runningAnimation = false;
   }
 
   function createLineButtons() {
@@ -320,15 +402,65 @@
     state.board = makeEmptyBoard();
     state.score = 0;
     state.maxTile = 0;
-    state.turn = 0;
     state.gameOver = false;
-    state.shiftedCells = new Set();
     state.mergedCells = new Set();
-    els.status.textContent = ' '; 
+    els.status.textContent = '操作: 行/列を選択→方向。キーボード: R/C + 1-5 + 矢印';
     els.status.classList.remove('over');
     spawnOne();
     spawnOne();
     render();
+  }
+
+  function handleKeyboard(event) {
+    if (state.runningAnimation) return;
+    const key = event.key;
+    if (key === 'h' || key === 'H') {
+      els.helpDialog.showModal();
+      return;
+    }
+    if (key === 'n' || key === 'N') {
+      resetGame();
+      return;
+    }
+    if (key === 'r' || key === 'R') {
+      state.pendingLineType = 'row';
+      els.status.textContent = 'Row選択モード: 1-5 で指定';
+      return;
+    }
+    if (key === 'c' || key === 'C') {
+      state.pendingLineType = 'col';
+      els.status.textContent = 'Column選択モード: 1-5 で指定';
+      return;
+    }
+
+    if (/^[1-5]$/.test(key)) {
+      setSelectedLine(state.pendingLineType, Number(key) - 1);
+      return;
+    }
+
+    if (key === 'ArrowLeft' || key === 'a' || key === 'A') {
+      if (state.selectedLine.type !== 'row') setSelectedLine('row', state.selectedLine.index);
+      executeTurn('left');
+      event.preventDefault();
+      return;
+    }
+    if (key === 'ArrowRight' || key === 'd' || key === 'D') {
+      if (state.selectedLine.type !== 'row') setSelectedLine('row', state.selectedLine.index);
+      executeTurn('right');
+      event.preventDefault();
+      return;
+    }
+    if (key === 'ArrowUp' || key === 'w' || key === 'W') {
+      if (state.selectedLine.type !== 'col') setSelectedLine('col', state.selectedLine.index);
+      executeTurn('up');
+      event.preventDefault();
+      return;
+    }
+    if (key === 'ArrowDown' || key === 's' || key === 'S') {
+      if (state.selectedLine.type !== 'col') setSelectedLine('col', state.selectedLine.index);
+      executeTurn('down');
+      event.preventDefault();
+    }
   }
 
   function attachEvents() {
@@ -339,6 +471,8 @@
     els.newGame.addEventListener('click', resetGame);
     els.help.addEventListener('click', () => els.helpDialog.showModal());
     els.closeHelp.addEventListener('click', () => els.helpDialog.close());
+    window.addEventListener('keydown', handleKeyboard);
+
     els.helpDialog.addEventListener('click', (event) => {
       const rect = els.helpDialog.getBoundingClientRect();
       const inDialog =
@@ -352,10 +486,9 @@
     let start = null;
     els.board.addEventListener('pointerdown', (e) => {
       const rect = els.board.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-      start = { x, y };
+      start = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     });
+
     els.board.addEventListener('pointerup', (e) => {
       if (!start) return;
       const rect = els.board.getBoundingClientRect();
@@ -371,13 +504,13 @@
 
       const startCol = Math.max(0, Math.min(SIZE - 1, Math.floor(start.x / (rect.width / SIZE))));
       const startRow = Math.max(0, Math.min(SIZE - 1, Math.floor(start.y / (rect.height / SIZE))));
-
       const horizontal = Math.abs(dx) > Math.abs(dy);
+
       if (horizontal) {
-        if (state.selectedLine.type !== 'row') setSelectedLine('row', startRow);
+        setSelectedLine('row', startRow);
         executeTurn(dx > 0 ? 'right' : 'left');
       } else {
-        if (state.selectedLine.type !== 'col') setSelectedLine('col', startCol);
+        setSelectedLine('col', startCol);
         executeTurn(dy > 0 ? 'down' : 'up');
       }
       start = null;
@@ -399,17 +532,12 @@
       gain: result.gain,
       chainCount: result.chainCount,
       mergedCells: Array.from(result.mergedCells),
+      mergeEvents: result.mergeEvents,
     };
   }
 
   window._debug = {
-    shiftLine: (type, index, dir, boardInput) => {
-      const backup = state.board;
-      state.board = cloneBoard(boardInput);
-      const out = shiftLine(type, index, dir);
-      state.board = backup;
-      return out;
-    },
+    shiftLine: (type, index, dir, boardInput) => shiftLine(cloneBoard(boardInput), type, index, dir),
     mergePhase: debugMerge,
     spawnValue: pickSpawnValue,
     setBoard: (boardInput) => {
